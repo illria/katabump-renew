@@ -249,6 +249,54 @@ async function solveTurnstileIfPresent(page, stageName = "通用", maxAttempts =
     return false;
 }
 
+// --- 等待 Turnstile token 真正生成（点击成功 ≠ token 有效） ---
+async function waitForTurnstileToken(page, timeoutMs = 30000) {
+    const startedAt = Date.now();
+    console.log(`[登录阶段] 等待 Turnstile token 生成 (最长 ${timeoutMs}ms)...`);
+
+    while (Date.now() - startedAt < timeoutMs) {
+        const tokenInfo = await page.evaluate(() => {
+            const selectors = [
+                'input[name="cf-turnstile-response"]',
+                'textarea[name="cf-turnstile-response"]',
+                'input[name="g-recaptcha-response"]',
+                'textarea[name="g-recaptcha-response"]'
+            ];
+
+            for (const selector of selectors) {
+                const element = document.querySelector(selector);
+                const value = (element && element.value ? element.value : '').trim();
+                if (value) {
+                    return {
+                        found: true,
+                        selector,
+                        length: value.length
+                    };
+                }
+            }
+
+            // 也检查 iframe 外可能的隐藏字段（querySelector 已覆盖主文档）
+            return {
+                found: false,
+                selector: null,
+                length: 0
+            };
+        }).catch(() => ({ found: false, selector: null, length: 0 }));
+
+        if (tokenInfo.found) {
+            console.log(
+                `[登录阶段] Turnstile token 已生成，字段=${tokenInfo.selector}，长度=${tokenInfo.length}`
+            );
+            return true;
+        }
+
+        await page.waitForTimeout(1000);
+    }
+
+    console.log('[登录阶段] Turnstile token 等待超时，未提交登录表单。');
+    return false;
+}
+
 // ============================================================
 //  新增辅助函数
 // ============================================================
@@ -561,9 +609,23 @@ async function ensureScreenshotsDir() {
             console.log('访问登录页面...');
             await page.goto('https://dashboard.katabump.com/auth/login', { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-            // 登录页 Turnstile
+            // 登录页 Turnstile：点击 → 等待 token 真正生成 → 再填表提交
+            // 全程使用同一 page / context / 代理 / Cookie，不刷新、不重建 page
             await page.waitForTimeout(3000);
             await solveTurnstileIfPresent(page, "登录阶段", 10, 5000);
+
+            const turnstileReady = await waitForTurnstileToken(page, 30000);
+            if (!turnstileReady) {
+                console.error('   >> ⚠️ Turnstile 点击后未生成有效 token，不提交登录表单。');
+                runStatus = 'captcha_required';
+                blockMessage = 'Turnstile click completed but no valid response token was generated';
+                renewSuccess = false;
+                await dumpDebugSnapshot(
+                    page,
+                    `login_turnstile_token_missing_${user.username.replace(/[^a-z0-9]/gi, '_')}`
+                );
+                continue;
+            }
 
             console.log('正在输入凭据...');
             try {
@@ -575,6 +637,26 @@ async function ensureScreenshotsDir() {
                 await pwdInput.fill(user.password);
 
                 await page.waitForTimeout(500);
+
+                // 提交前再确认 token 仍在（防止 fill 过程中失效）
+                const tokenStillValid = await page.evaluate(() => {
+                    const el = document.querySelector('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"], input[name="g-recaptcha-response"], textarea[name="g-recaptcha-response"]');
+                    return !!(el && el.value && el.value.trim().length > 0);
+                }).catch(() => false);
+
+                if (!tokenStillValid) {
+                    console.error('   >> ⚠️ 提交前 Turnstile token 已丢失，不提交登录表单。');
+                    runStatus = 'captcha_required';
+                    blockMessage = 'Turnstile token disappeared before login submit';
+                    renewSuccess = false;
+                    await dumpDebugSnapshot(
+                        page,
+                        `login_turnstile_token_lost_${user.username.replace(/[^a-z0-9]/gi, '_')}`
+                    );
+                    continue;
+                }
+                console.log('[登录阶段] 提交前 token 仍有效，提交 Login...');
+
                 await page.getByRole('button', { name: 'Login', exact: true }).click();
 
                 // 登录后诊断：保存截图 + HTML，输出 URL / 标题 / body 片段
@@ -605,18 +687,54 @@ async function ensureScreenshotsDir() {
                     }
                 } catch (e) { }
 
+                // 检查验证码是否被服务端接受（error=captcha / Please complete captcha）
+                {
+                    const captchaUrlHit = /error=captcha/i.test(loginUrl);
+                    const captchaTextHit = /Please complete captcha/i.test(loginBody)
+                        || /captcha required/i.test(loginBody)
+                        || /complete captcha/i.test(loginBody);
+                    if (captchaUrlHit || captchaTextHit) {
+                        console.error(`   >> ⚠️ 登录验证码未被服务端接受 (URL: ${loginUrl})`);
+                        runStatus = 'captcha_required';
+                        blockMessage = 'Login captcha was not accepted';
+                        renewSuccess = false;
+                        const photoDir2 = await ensureScreenshotsDir();
+                        await page.screenshot({ path: path.join(photoDir2, `login_captcha_required_${user.username.replace(/[^a-z0-9]/gi, '_')}.png`), fullPage: true });
+                        try {
+                            const html2 = await page.content();
+                            fs.writeFileSync(path.join(photoDir2, `login_captcha_required_${user.username.replace(/[^a-z0-9]/gi, '_')}.html`), html2, 'utf-8');
+                        } catch (e) { }
+                        continue;
+                    }
+                }
+
             } catch (e) {
                 console.log('登录操作遇到异常 (可能是已登录或超时):', e.message);
             }
 
             // 2. 登录后进入 dashboard（多策略 fallback）
+            // 再次确认当前 URL 不含 error=captcha（防止 try 块外漏检）
+            if (/error=captcha/i.test(page.url())) {
+                console.error(`   >> ⚠️ 登录验证码未被服务端接受 (URL: ${page.url()})`);
+                runStatus = 'captcha_required';
+                blockMessage = 'Login captcha was not accepted';
+                renewSuccess = false;
+                const photoDir = await ensureScreenshotsDir();
+                await page.screenshot({ path: path.join(photoDir, `login_captcha_required_${user.username.replace(/[^a-z0-9]/gi, '_')}.png`), fullPage: true });
+                try {
+                    const html = await page.content();
+                    fs.writeFileSync(path.join(photoDir, `login_captcha_required_${user.username.replace(/[^a-z0-9]/gi, '_')}.html`), html, 'utf-8');
+                } catch (e) { }
+                continue;
+            }
+
             console.log('正在寻找 dashboard / server 入口...');
 
             let dashboardReady = false;
 
-            // 策略 1: URL 已包含 dashboard
+            // 策略 1: URL 已包含 dashboard（排除仍在 /auth/login 的情况）
             try {
-                await page.waitForURL(url => url.includes('dashboard'), { timeout: 5000 });
+                await page.waitForURL(url => /dashboard/i.test(url) && !/auth\/login/i.test(url), { timeout: 5000 });
                 console.log('[登录] URL 已跳转到 dashboard。');
                 dashboardReady = true;
             } catch (e) { }
@@ -624,7 +742,7 @@ async function ensureScreenshotsDir() {
             // 策略 2: 页面文本包含 dashboard / server identifier / 服务器列表
             if (!dashboardReady) {
                 const bodyText = await getPageText(page);
-                if (/dashboard/i.test(bodyText) && /server/i.test(bodyText)) {
+                if (/dashboard/i.test(bodyText) && /server/i.test(bodyText) && !/Please complete captcha/i.test(bodyText)) {
                     console.log('[登录] 页面文本检测到 dashboard + server，判定登录成功。');
                     dashboardReady = true;
                 }
@@ -655,8 +773,26 @@ async function ensureScreenshotsDir() {
             }
 
             if (!dashboardReady) {
+                // 最后再检查一次 captcha 错误，避免误标为 login_failed
+                const finalUrl = page.url();
+                const finalBody = await getPageText(page);
+                if (/error=captcha/i.test(finalUrl) || /Please complete captcha/i.test(finalBody) || /complete captcha/i.test(finalBody)) {
+                    console.error(`   >> ⚠️ 登录验证码未被服务端接受 (URL: ${finalUrl})`);
+                    runStatus = 'captcha_required';
+                    blockMessage = 'Login captcha was not accepted';
+                    renewSuccess = false;
+                    const photoDir = await ensureScreenshotsDir();
+                    await page.screenshot({ path: path.join(photoDir, `login_captcha_required_${user.username.replace(/[^a-z0-9]/gi, '_')}.png`), fullPage: true });
+                    try {
+                        const html = await page.content();
+                        fs.writeFileSync(path.join(photoDir, `login_captcha_required_${user.username.replace(/[^a-z0-9]/gi, '_')}.html`), html, 'utf-8');
+                    } catch (e) { }
+                    continue;
+                }
+
                 console.log('login_failed: 未找到 dashboard 入口 (See / Access server / View / dashboard URL)。');
                 runStatus = 'login_failed';
+                blockMessage = 'Dashboard entry not found after login';
                 const photoDir = await ensureScreenshotsDir();
                 await page.screenshot({ path: path.join(photoDir, `login_failed_no_dashboard_${user.username.replace(/[^a-z0-9]/gi, '_')}.png`), fullPage: true });
                 continue;
