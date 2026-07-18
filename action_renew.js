@@ -1325,7 +1325,7 @@ async function ensureScreenshotsDir() {
 
                 if (!tokenStillValid.found) {
                     console.error('   >> ⚠️ 提交前 Turnstile token 已丢失，不提交登录表单。');
-                    runStatus = 'captcha_required';
+                    runStatus = 'login_captcha_required';
                     blockMessage = 'Turnstile token disappeared before login submit';
                     renewSuccess = false;
                     await dumpDebugSnapshot(
@@ -1378,7 +1378,7 @@ async function ensureScreenshotsDir() {
                         || /complete captcha/i.test(loginBody);
                     if (captchaUrlHit || captchaTextHit) {
                         console.error(`   >> ⚠️ 登录验证码未被服务端接受 (URL: ${loginUrl})`);
-                        runStatus = 'captcha_required';
+                        runStatus = 'login_captcha_required';
                         blockMessage = 'Login captcha was not accepted';
                         renewSuccess = false;
                         const photoDir2 = await ensureScreenshotsDir();
@@ -1401,7 +1401,7 @@ async function ensureScreenshotsDir() {
             // 再次确认当前 URL 不含 error=captcha（防止 try 块外漏检）
             if (/error=captcha/i.test(page.url())) {
                 console.error(`   >> ⚠️ 登录验证码未被服务端接受 (URL: ${page.url()})`);
-                runStatus = 'captcha_required';
+                runStatus = 'login_captcha_required';
                 blockMessage = 'Login captcha was not accepted';
                 renewSuccess = false;
                 const photoDir = await ensureScreenshotsDir();
@@ -1465,7 +1465,7 @@ async function ensureScreenshotsDir() {
                 const finalBody = await getPageText(page);
                 if (/error=captcha/i.test(finalUrl) || /Please complete captcha/i.test(finalBody) || /complete captcha/i.test(finalBody)) {
                     console.error(`   >> ⚠️ 登录验证码未被服务端接受 (URL: ${finalUrl})`);
-                    runStatus = 'captcha_required';
+                    runStatus = 'login_captcha_required';
                     blockMessage = 'Login captcha was not accepted';
                     renewSuccess = false;
                     const photoDir = await ensureScreenshotsDir();
@@ -1774,7 +1774,7 @@ async function ensureScreenshotsDir() {
                         await dumpDebugSnapshot(page, `expiry_unchanged_${attempt}`);
                         break;
                     } else {
-                        console.log('   >> Modal 已关闭，无法读取 Expiry，假设成功。');
+                        console.log('   >> Modal 已关闭，但无法读取新 Expiry，标记 unknown。');
                         renewSuccess = true;
                         runStatus = 'success';
                         break;
