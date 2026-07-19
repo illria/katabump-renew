@@ -42,7 +42,7 @@ jobs:
       group: katabump-renew
       cancel-in-progress: false
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
 
     steps:
     - uses: actions/checkout@v4
@@ -73,7 +73,14 @@ jobs:
       run: |
         if [ -n "$WEBSHARE_PROXY_LIST_URL" ]; then
           echo "Downloading Webshare proxy list..."
-          curl -fsSL "${WEBSHARE_PROXY_LIST_URL}" -o proxies.txt
+          curl -fsSL \
+            --retry 3 \
+            --retry-delay 3 \
+            --retry-all-errors \
+            --connect-timeout 15 \
+            --max-time 90 \
+            "${WEBSHARE_PROXY_LIST_URL}" \
+            -o proxies.txt
           echo "Proxy list downloaded. Lines: $(wc -l < proxies.txt)"
         else
           echo "WEBSHARE_PROXY_LIST_URL is empty, running without Webshare proxy."

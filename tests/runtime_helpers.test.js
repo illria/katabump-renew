@@ -186,7 +186,7 @@ async function tests() {
     const normalProcess = new FakeProcess((signal, proc) => {
         if (signal === 'SIGTERM') setTimeout(() => proc.emit('exit', 0), 1);
     });
-    const normalResultPromise = runChildWithTimeout(normalProcess, { timeoutMs: 30, gracefulMs: 10, logger: () => {} });
+    const normalResultPromise = runChildWithTimeout(normalProcess, { timeoutMs: 30, gracefulMs: 10, logger: () => {}, killGroup: () => false });
     setTimeout(() => normalProcess.emit('exit', 0), 1);
     const normalResult = await normalResultPromise;
     assert.deepStrictEqual(normalResult, { code: 0, timedOut: false });
@@ -195,7 +195,7 @@ async function tests() {
     const gracefulProcess = new FakeProcess((signal, proc) => {
         if (signal === 'SIGTERM') setTimeout(() => proc.emit('exit', 0), 1);
     });
-    const gracefulResult = await runChildWithTimeout(gracefulProcess, { timeoutMs: 5, gracefulMs: 20, logger: () => {} });
+    const gracefulResult = await runChildWithTimeout(gracefulProcess, { timeoutMs: 5, gracefulMs: 20, logger: () => {}, killGroup: () => false });
     assert.strictEqual(gracefulResult.code, 1);
     assert.strictEqual(gracefulResult.timedOut, true);
     assert.deepStrictEqual(gracefulProcess.signals, ['SIGTERM']);
@@ -205,7 +205,8 @@ async function tests() {
         timeoutMs: 5,
         gracefulMs: 5,
         finalSettlementMs: 5,
-        logger: () => {}
+        logger: () => {},
+        killGroup: () => false
     });
     assert.strictEqual(forcedResult.code, 1);
     assert.strictEqual(forcedResult.timedOut, true);
@@ -213,7 +214,7 @@ async function tests() {
     assert.deepStrictEqual(forcedProcess.signals, ['SIGTERM', 'SIGKILL']);
 
     const raceProcess = new FakeProcess();
-    const raceResultPromise = runChildWithTimeout(raceProcess, { timeoutMs: 30, logger: () => {} });
+    const raceResultPromise = runChildWithTimeout(raceProcess, { timeoutMs: 30, logger: () => {}, killGroup: () => false });
     raceProcess.emit('exit', 0);
     raceProcess.emit('error', new Error('late error'));
     const raceResult = await raceResultPromise;
