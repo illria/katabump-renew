@@ -87,39 +87,51 @@ function parseProxyLine(line, lineNumber) {
     const isValidPort = (s) => /^[0-9]+$/.test(s) && s.length > 0 && s.length <= 5 && Number(s) >= 1 && Number(s) <= 65535;
     const isValidHost = (s) => s && !s.includes(' ') && !s.includes('/') && !s.includes('?') && !s.includes('#');
 
-    // Reject bare USER:PASS@HOST:PORT to avoid ambiguity with Webshare format.
-    // Only http://USER:PASSWORD@HOST:PORT is accepted as URL format.
-    // However, allow HOST:PORT:USER:PASSWORD when the first segment looks like a host.
-    if (!trimmed.startsWith('http://') && trimmed.includes('@')) {
-        const firstColon = trimmed.indexOf(':');
-        const firstSegment = firstColon > 0 ? trimmed.substring(0, firstColon) : '';
-        const looksLikeHost = firstColon > 0 && /[.\d-]/.test(firstSegment);
-        if (!looksLikeHost) {
-            return { valid: false, reason: 'ambiguous_format_use_webshare_or_http_url', lineNumber };
-        }
-    }
-
     // Format 1: http://USER:PASSWORD@HOST:PORT
     if (trimmed.startsWith('http://')) {
-        const withoutScheme = trimmed.substring(7);
-        const atIdx = withoutScheme.indexOf('@');
-        if (atIdx > 0 && withoutScheme.lastIndexOf('@') === atIdx) {
-            const auth = withoutScheme.substring(0, atIdx);
-            const hostPort = withoutScheme.substring(atIdx + 1);
-            const credParts = auth.split(':');
-            const hpParts = hostPort.split(':');
-            if (credParts.length >= 2 && hpParts.length >= 2) {
-                const username = credParts[0];
-                const password = credParts.slice(1).join(':');
-                const host = hpParts[0];
-                const port = hpParts[1];
-                if (username && password && isValidHost(host) && isValidPort(port)) {
-                    return { valid: true, ip: host, port, username, password, lineNumber };
-                }
-                return { valid: false, reason: 'invalid_credentials', lineNumber };
-            }
+        let parsedUrl;
+        try {
+            parsedUrl = new URL(trimmed);
+        } catch {
+            return { valid: false, reason: 'invalid_url_format', lineNumber };
         }
-        return { valid: false, reason: 'invalid_url_format', lineNumber };
+
+        // URL format is exactly http://USERNAME:PASSWORD@HOST:PORT.
+        // URL accepts paths, queries, and fragments, but none are part of the
+        // frozen proxy input format. A trailing extra host field is rejected by
+        // URL itself as an invalid port.
+        const explicitPortMatch = trimmed.match(/:(\d+)\/?$/);
+        const port = (explicitPortMatch && explicitPortMatch[1]) || parsedUrl.port;
+
+        if (
+            parsedUrl.protocol !== 'http:' ||
+            !parsedUrl.hostname ||
+            !port ||
+            parsedUrl.pathname !== '/' ||
+            parsedUrl.search ||
+            parsedUrl.hash ||
+            !parsedUrl.username ||
+            !parsedUrl.password
+        ) {
+            return { valid: false, reason: 'invalid_url_format', lineNumber };
+        }
+
+        let username;
+        let password;
+        try {
+            username = decodeURIComponent(parsedUrl.username);
+            password = decodeURIComponent(parsedUrl.password);
+        } catch {
+            return { valid: false, reason: 'invalid_url_encoding', lineNumber };
+        }
+
+        if (!username || !password) {
+            return { valid: false, reason: 'invalid_credentials', lineNumber };
+        }
+        if (!isValidHost(parsedUrl.hostname) || !isValidPort(port)) {
+            return { valid: false, reason: 'invalid_url_format', lineNumber };
+        }
+        return { valid: true, ip: parsedUrl.hostname, port, username, password, lineNumber };
     }
 
     // Format 2: HOST:PORT or HOST:PORT:USER:PASSWORD (Webshare standard)
@@ -153,6 +165,7 @@ function parseProxyLine(line, lineNumber) {
 
 function buildHttpProxy(parsed) {
     if (!parsed || !parsed.valid || !parsed.ip || !parsed.port) return null;
+    if ((parsed.username && !parsed.password) || (!parsed.username && parsed.password)) return null;
     const encodedUser = parsed.username ? encodeURIComponent(parsed.username) : '';
     const encodedPass = parsed.password ? encodeURIComponent(parsed.password) : '';
     const auth = [encodedUser, encodedPass].filter(Boolean).join(':');
@@ -232,9 +245,10 @@ function loadProxies() {
     const invalid = [];
     for (const { trimmed, lineNumber } of nonEmptyLines) {
         const parsed = parseProxyLine(trimmed, lineNumber);
-        if (parsed.valid) {
+        if (parsed.valid && buildHttpProxy(parsed)) {
             valid.push(parsed);
         } else {
+            if (parsed.valid) parsed.reason = 'invalid_proxy_url';
             invalid.push(parsed);
         }
     }
