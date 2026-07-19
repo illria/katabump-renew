@@ -27,8 +27,7 @@ async function sendTelegramMessage(message, imagePath = null) {
         const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`;
         await axios.post(url, {
             chat_id: TG_CHAT_ID,
-            text: message,
-            parse_mode: 'Markdown'
+            text: message
         });
         console.log('[Telegram] Message sent.');
     } catch (e) {
@@ -54,6 +53,7 @@ const DEBUG_PORT = 9222;
 process.env.NO_PROXY = 'localhost,127.0.0.1';
 
 const HTTP_PROXY = process.env.HTTP_PROXY;
+const TARGET_LOGIN_URL = 'https://dashboard.katabump.com/auth/login';
 let PROXY_CONFIG = null;
 
 if (HTTP_PROXY) {
@@ -139,9 +139,12 @@ async function checkProxy() {
                 password: PROXY_CONFIG.password
             };
         }
-        await axios.get('https://www.google.com', axiosConfig);
-        console.log('[代理] 连接成功！');
-        return { ok: true };
+        const response = await axios.get(TARGET_LOGIN_URL, {
+            ...axiosConfig,
+            validateStatus: () => true
+        });
+        console.log(`[代理] 目标页面可达，HTTP 状态=${response.status}`);
+        return { ok: true, status: response.status };
     } catch (error) {
         console.error(`[代理] 连接失败: ${error.message}`);
         return { ok: false, error: error.message };
@@ -1275,6 +1278,14 @@ function mergeExitCode(current, newCode) {
     if (!browser) process.exit(1);
 
     const defaultContext = browser.contexts()[0];
+    const browserContextOptions = PROXY_CONFIG && PROXY_CONFIG.username
+        ? {
+            httpCredentials: {
+                username: PROXY_CONFIG.username,
+                password: PROXY_CONFIG.password
+            }
+        }
+        : {};
     let context = null;
     let page = null;
 
@@ -1295,22 +1306,14 @@ function mergeExitCode(current, newCode) {
         try {
             // 每个账号使用独立的 BrowserContext，隔离 Cookie、Storage、IndexedDB、
             // Service Worker、Cache Storage 以及其他 Context 级状态。
-            context = await browser.newContext();
+            context = await browser.newContext(browserContextOptions);
             page = await context.newPage();
             page.setDefaultTimeout(60000);
-            if (PROXY_CONFIG && PROXY_CONFIG.username) {
-                await context.setHTTPCredentials({
-                    username: PROXY_CONFIG.username,
-                    password: PROXY_CONFIG.password
-                });
-            } else {
-                await context.setHTTPCredentials(null);
-            }
             await page.addInitScript(INJECTED_SCRIPT);
 
             // 1. 访问登录页
             console.log('访问登录页面...');
-            await page.goto('https://dashboard.katabump.com/auth/login', { waitUntil: 'domcontentloaded', timeout: 60000 });
+            await page.goto(TARGET_LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
             // 登录页 Turnstile 严格状态机：
             // widget 健康 → 点击 → 等 token → token 有值才提交
@@ -1932,31 +1935,33 @@ function mergeExitCode(current, newCode) {
             console.error(`Error processing user:`, err);
             runStatus = 'error';
             blockMessage = err.message;
-            const photoDir = await ensureScreenshotsDir();
+        } finally {
+            // 截图和目录创建都是诊断增强项，任何失败都不能阻断账号会话清理。
+            let photoDir = null;
             try {
-                await page.screenshot({ path: path.join(photoDir, `error_${user.username.replace(/[^a-z0-9]/gi, '_')}.png`), fullPage: true });
-            } catch (e) { }
+                photoDir = await ensureScreenshotsDir();
+            } catch (e) {
+                console.error('[cleanup] 截图目录不可用:', e.message);
+            }
+            if (photoDir && page) {
+                const safeUsername = user.username.replace(/[^a-z0-9]/gi, '_');
+                try {
+                    await page.screenshot({ path: path.join(photoDir, `${safeUsername}.png`), fullPage: true });
+                } catch (e) { }
+            }
+            try {
+                if (page) await page.close();
+                if (context) await context.close();
+            } catch (e) {
+                console.log('[cleanup] 账号 BrowserContext 关闭异常:', e.message);
+            } finally {
+                page = null;
+                context = null;
+            }
         }
 
         if (stopCurrentUser) {
             console.log('[主流程] 当前账号结束，继续下一个账号');
-        }
-
-        // 用户处理完成，发送最终状态通知
-        const safeUsername = user.username.replace(/[^a-z0-9]/gi, '_');
-        const photoDir = await ensureScreenshotsDir();
-        try {
-            await page.screenshot({ path: path.join(photoDir, `${safeUsername}.png`), fullPage: true });
-        } catch (e) { }
-
-        try {
-            if (page) await page.close();
-            if (context) await context.close();
-        } catch (e) {
-            console.log('[cleanup] 账号 BrowserContext 关闭异常:', e.message);
-        } finally {
-            page = null;
-            context = null;
         }
 
         // Telegram 通知

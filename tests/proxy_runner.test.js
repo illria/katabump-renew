@@ -51,6 +51,10 @@ function tests() {
             expect: { ip: 'host', port: '80', username: '', password: '', valid: true }
         },
         {
+            line: 'Proxy.EXAMPLE.com:8080:user:pass',
+            expect: { ip: 'proxy.example.com', port: '8080', username: 'user', password: 'pass', valid: true }
+        },
+        {
             line: '1.2.3.4:0',
             expect: { valid: false, reason: 'invalid_port:0' }
         },

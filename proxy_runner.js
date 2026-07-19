@@ -148,7 +148,7 @@ function parseProxyLine(line, lineNumber) {
         if (!isValidHost(ip)) return { valid: false, reason: 'invalid_host', lineNumber };
         if (!port) return { valid: false, reason: 'empty_port', lineNumber };
         if (!isValidPort(port)) return { valid: false, reason: `invalid_port:${port}`, lineNumber };
-        return { valid: true, ip, port, username: '', password: '', lineNumber };
+        return { valid: true, ip: ip.toLowerCase(), port, username: '', password: '', lineNumber };
     }
 
     if (colonParts.length >= 4) {
@@ -161,7 +161,7 @@ function parseProxyLine(line, lineNumber) {
         if (!port) return { valid: false, reason: 'empty_port', lineNumber };
         if (!isValidPort(port)) return { valid: false, reason: `invalid_port:${port}`, lineNumber };
         if (!username || !password) return { valid: false, reason: 'invalid_credentials', lineNumber };
-        return { valid: true, ip, port, username, password, lineNumber };
+        return { valid: true, ip: ip.toLowerCase(), port, username, password, lineNumber };
     }
 
     return { valid: false, reason: `invalid_field_count:${colonParts.length}`, lineNumber };
