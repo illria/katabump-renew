@@ -84,40 +84,52 @@ function parseProxyLine(line, lineNumber) {
     const trimmed = (line || '').trim();
     if (!trimmed || trimmed.startsWith('#')) return { valid: false, reason: 'empty_or_comment', lineNumber };
 
-    // Helper: strict decimal port 1-65535
     const isValidPort = (s) => /^[0-9]+$/.test(s) && s.length > 0 && s.length <= 5 && Number(s) >= 1 && Number(s) <= 65535;
+    const isValidHost = (s) => s && !s.includes(' ') && !s.includes('/') && !s.includes('?') && !s.includes('#');
 
-    // Prefer USER:PASS@HOST:PORT when the suffix after the LAST @ looks like HOST:PORT
-    const atIdx = trimmed.lastIndexOf('@');
-    if (atIdx > 0) {
-        const after = trimmed.substring(atIdx + 1);
-        const afterParts = after.split(':');
-        if (afterParts.length > 2) {
-            return { valid: false, reason: `invalid_host_field_count:${afterParts.length}`, lineNumber };
+    // Reject bare USER:PASS@HOST:PORT to avoid ambiguity with Webshare format.
+    // Only http://USER:PASSWORD@HOST:PORT is accepted as URL format.
+    // However, allow HOST:PORT:USER:PASSWORD when the first segment looks like a host.
+    if (!trimmed.startsWith('http://') && trimmed.includes('@')) {
+        const firstColon = trimmed.indexOf(':');
+        const firstSegment = firstColon > 0 ? trimmed.substring(0, firstColon) : '';
+        const looksLikeHost = firstColon > 0 && /[.\d-]/.test(firstSegment);
+        if (!looksLikeHost) {
+            return { valid: false, reason: 'ambiguous_format_use_webshare_or_http_url', lineNumber };
         }
-        if (afterParts.length === 2 && afterParts[0] && isValidPort(afterParts[1])) {
-            const before = trimmed.substring(0, atIdx);
-            const firstColon = before.indexOf(':');
-            if (firstColon > 0) {
-                const username = before.substring(0, firstColon);
-                const password = before.substring(firstColon + 1);
-                const hasUser = username.length > 0;
-                const hasPass = password.length > 0;
-                if (hasUser && hasPass) {
-                    return { valid: true, ip: afterParts[0], port: afterParts[1], username, password, lineNumber };
+    }
+
+    // Format 1: http://USER:PASSWORD@HOST:PORT
+    if (trimmed.startsWith('http://')) {
+        const withoutScheme = trimmed.substring(7);
+        const atIdx = withoutScheme.indexOf('@');
+        if (atIdx > 0 && withoutScheme.lastIndexOf('@') === atIdx) {
+            const auth = withoutScheme.substring(0, atIdx);
+            const hostPort = withoutScheme.substring(atIdx + 1);
+            const credParts = auth.split(':');
+            const hpParts = hostPort.split(':');
+            if (credParts.length >= 2 && hpParts.length >= 2) {
+                const username = credParts[0];
+                const password = credParts.slice(1).join(':');
+                const host = hpParts[0];
+                const port = hpParts[1];
+                if (username && password && isValidHost(host) && isValidPort(port)) {
+                    return { valid: true, ip: host, port, username, password, lineNumber };
                 }
                 return { valid: false, reason: 'invalid_credentials', lineNumber };
             }
         }
-        // @ present but not matching USER:PASS@HOST:PORT → fall through to colon-count
+        return { valid: false, reason: 'invalid_url_format', lineNumber };
     }
 
+    // Format 2: HOST:PORT or HOST:PORT:USER:PASSWORD (Webshare standard)
     const colonParts = trimmed.split(':');
 
     if (colonParts.length === 2) {
         const ip = colonParts[0];
         const port = colonParts[1];
         if (!ip) return { valid: false, reason: 'empty_ip', lineNumber };
+        if (!isValidHost(ip)) return { valid: false, reason: 'invalid_host', lineNumber };
         if (!port) return { valid: false, reason: 'empty_port', lineNumber };
         if (!isValidPort(port)) return { valid: false, reason: `invalid_port:${port}`, lineNumber };
         return { valid: true, ip, port, username: '', password: '', lineNumber };
@@ -126,16 +138,13 @@ function parseProxyLine(line, lineNumber) {
     if (colonParts.length >= 4) {
         const ip = colonParts[0];
         const port = colonParts[1];
-        if (!ip) return { valid: false, reason: 'empty_ip', lineNumber };
-        if (!port) return { valid: false, reason: 'empty_port', lineNumber };
-        if (!isValidPort(port)) return { valid: false, reason: `invalid_port:${port}`, lineNumber };
         const username = colonParts[2] || '';
         const password = colonParts.slice(3).join(':') || '';
-        const hasUser = username.length > 0;
-        const hasPass = password.length > 0;
-        if (!(hasUser && hasPass)) {
-            return { valid: false, reason: 'invalid_credentials', lineNumber };
-        }
+        if (!ip) return { valid: false, reason: 'empty_ip', lineNumber };
+        if (!isValidHost(ip)) return { valid: false, reason: 'invalid_host', lineNumber };
+        if (!port) return { valid: false, reason: 'empty_port', lineNumber };
+        if (!isValidPort(port)) return { valid: false, reason: `invalid_port:${port}`, lineNumber };
+        if (!username || !password) return { valid: false, reason: 'invalid_credentials', lineNumber };
         return { valid: true, ip, port, username, password, lineNumber };
     }
 
@@ -147,9 +156,18 @@ function buildHttpProxy(parsed) {
     const encodedUser = parsed.username ? encodeURIComponent(parsed.username) : '';
     const encodedPass = parsed.password ? encodeURIComponent(parsed.password) : '';
     const auth = [encodedUser, encodedPass].filter(Boolean).join(':');
-    return auth
+    const urlStr = auth
         ? `http://${auth}@${parsed.ip}:${parsed.port}`
         : `http://${parsed.ip}:${parsed.port}`;
+    try {
+        const u = new URL(urlStr);
+        if (!u.hostname || u.hostname.includes(' ') || u.pathname !== '/' && u.pathname !== '') {
+            return null;
+        }
+    } catch {
+        return null;
+    }
+    return urlStr;
 }
 
 function proxyKey(parsed) {

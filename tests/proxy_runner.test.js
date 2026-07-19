@@ -30,7 +30,7 @@ function tests() {
             expect: { ip: '1.2.3.4', port: '8080', username: 'user', password: 'password', valid: true }
         },
         {
-            line: 'user:pass@1.2.3.4:8080',
+            line: 'http://user:pass@1.2.3.4:8080',
             expect: { ip: '1.2.3.4', port: '8080', username: 'user', password: 'pass', valid: true }
         },
         {
@@ -91,16 +91,28 @@ function tests() {
         },
         {
             line: 'user:123:secret@1.2.3.4:8080',
-            expect: { ip: '1.2.3.4', port: '8080', username: 'user', password: '123:secret', valid: true }
+            expect: { valid: false, reason: 'ambiguous_format_use_webshare_or_http_url' }
         },
         {
             line: 'user:pa:ss@1.2.3.4:8080',
-            expect: { ip: '1.2.3.4', port: '8080', username: 'user', password: 'pa:ss', valid: true }
+            expect: { valid: false, reason: 'ambiguous_format_use_webshare_or_http_url' }
+        },
+        {
+            line: 'user:pass@1.2.3.4:8080',
+            expect: { valid: false, reason: 'ambiguous_format_use_webshare_or_http_url' }
         },
         {
             line: 'user:pass@1.2.3.4:8080:garbage',
-            expect: { valid: false, reason: 'invalid_host_field_count:3' }
-        }
+            expect: { valid: false, reason: 'ambiguous_format_use_webshare_or_http_url' }
+        },
+        {
+            line: 'bad host:8080',
+            expect: { valid: false, reason: 'invalid_host' }
+        },
+        {
+            line: '1.2.3.4:8080:user:pa@ss:one:two',
+            expect: { ip: '1.2.3.4', port: '8080', username: 'user', password: 'pa@ss:one:two', valid: true }
+        },
     ];
 
     for (const sample of samples) {
