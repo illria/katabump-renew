@@ -60,6 +60,7 @@ let PROXY_CONFIG = null;
 let PROXY_CONFIG_ERROR = null;
 let DEBUG_PORT = null;
 let activeBrowserConnection = null;
+let activeCdpAnchorPage = null;
 let activeChromeChild = null;
 let activeChromeUserDataDir = null;
 let shutdownRequested = false;
@@ -261,15 +262,34 @@ async function connectToChrome() {
     throw new Error(`CDP 连接失败: ${lastError ? lastError.message : 'unknown error'}`);
 }
 
-async function prepareCdpAccountPage(browser) {
+async function ensureCdpAnchorPage(browser) {
     const contexts = browser.contexts();
     const context = contexts[0];
     if (!context) throw new Error('CDP 浏览器没有可用的默认 BrowserContext');
-    await context.clearCookies();
-    for (const existingPage of context.pages()) {
-        await existingPage.close().catch(() => {});
+
+    if (!activeCdpAnchorPage || activeCdpAnchorPage.isClosed()) {
+        const existingPages = context.pages();
+        activeCdpAnchorPage = existingPages[0] || await context.newPage();
+        await activeCdpAnchorPage.goto('about:blank').catch(() => {});
     }
+
+    return { context, page: activeCdpAnchorPage };
+}
+
+async function prepareCdpAccountPage(browser) {
+    const { context } = await ensureCdpAnchorPage(browser);
+    await context.clearCookies();
+
+    // 先创建账号页，确保 Chrome 始终保留 anchor page，不关闭最后一个窗口。
     const page = await context.newPage();
+
+    // 清理上一个账号或异常流程遗留的页面，但保留 anchor 和当前账号页。
+    for (const existingPage of context.pages()) {
+        if (existingPage !== activeCdpAnchorPage && existingPage !== page) {
+            await existingPage.close().catch(() => {});
+        }
+    }
+
     if (PROXY_CONFIG && PROXY_CONFIG.username && PROXY_CONFIG.password && typeof context.setHTTPCredentials === 'function') {
         await context.setHTTPCredentials({
             username: PROXY_CONFIG.username,
@@ -1412,6 +1432,7 @@ async function runMain() {
     try {
         await launchChrome();
         browser = await connectToChrome();
+        await ensureCdpAnchorPage(browser);
     } catch (error) {
         console.error('[主流程] Chrome/CDP 启动失败:', error.message);
         return EXIT_CODE.FATAL;
@@ -2146,8 +2167,20 @@ async function runMain() {
 
 async function closeActiveBrowser() {
     const browser = activeBrowserConnection;
+    const anchorPage = activeCdpAnchorPage;
     activeBrowserConnection = null;
-    if (!browser) return;
+    activeCdpAnchorPage = null;
+
+    if (!browser) {
+        if (anchorPage) {
+            try {
+                if (!anchorPage.isClosed()) await anchorPage.close();
+            } catch (error) {
+                console.error('[cleanup] anchor page 关闭失败:', error.message);
+            }
+        }
+        return;
+    }
 
     let contexts = [];
     try {
@@ -2163,12 +2196,25 @@ async function closeActiveBrowser() {
             console.error('[cleanup] 无法读取 Context 页面:', error.message);
         }
         for (const page of pages) {
+            if (page === anchorPage) continue;
             try {
                 await page.close();
             } catch (error) {
                 console.error('[cleanup] 残留 page 关闭失败:', error.message);
             }
         }
+    }
+
+    // 所有账号页关闭后，最后关闭整个任务期间保留的 anchor page。
+    if (anchorPage) {
+        try {
+            if (!anchorPage.isClosed()) await anchorPage.close();
+        } catch (error) {
+            console.error('[cleanup] anchor page 关闭失败:', error.message);
+        }
+    }
+
+    for (const context of contexts) {
         try {
             await context.close();
         } catch (error) {
