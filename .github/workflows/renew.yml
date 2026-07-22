@@ -1,99 +1,112 @@
 name: Katabump Auto Renew
 
 on:
+  push:
+  pull_request:
   schedule:
-    # 每天 UTC 0点，北京时间 8点运行
     - cron: '0 0 * * *'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  renew:
+  check:
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    concurrency:
+      group: katabump-check-${{ github.ref }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v4
+    - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '24'
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '24'
 
-      - name: Install Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb curl
-          npm install
-          npx playwright install-deps chrome
+    - name: Install dependencies
+      run: npm ci
 
-      - name: Pick Webshare proxy
-        env:
-          WEBSHARE_PROXY_LIST_URL: ${{ secrets.WEBSHARE_PROXY_LIST_URL }}
-        run: |
-          if [ -z "$WEBSHARE_PROXY_LIST_URL" ]; then
-            echo "WEBSHARE_PROXY_LIST_URL is empty, running without Webshare proxy."
-            echo "HTTP_PROXY=" >> "$GITHUB_ENV"
-            echo "HTTPS_PROXY=" >> "$GITHUB_ENV"
-            exit 0
-          fi
+    - name: Syntax and unit checks
+      run: npm run check
 
+    - name: Load runtime dependencies
+      run: node -e "require('axios'); require('playwright-extra'); require('puppeteer-extra-plugin-stealth')"
+
+  renew:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    concurrency:
+      group: katabump-renew
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '24'
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y xvfb netcat-openbsd
+        npm ci
+        npx playwright install-deps chrome
+
+    - name: Restore proxy cooldown cache
+      uses: actions/cache@v4
+      with:
+        path: proxy-cooldown.json
+        key: katabump-proxy-cooldown-${{ github.run_id }}
+        restore-keys: |
+          katabump-proxy-cooldown-
+
+    - name: Download proxy list
+      env:
+        WEBSHARE_PROXY_LIST_URL: ${{ secrets.WEBSHARE_PROXY_LIST_URL }}
+      run: |
+        if [ -n "$WEBSHARE_PROXY_LIST_URL" ]; then
           echo "Downloading Webshare proxy list..."
-          curl -fsSL "${WEBSHARE_PROXY_LIST_URL}" -o proxies.txt
-          echo "Proxy list downloaded. Total lines: $(wc -l < proxies.txt)"
+          curl -fsSL \
+            --retry 3 \
+            --retry-delay 3 \
+            --retry-all-errors \
+            --connect-timeout 15 \
+            --max-time 90 \
+            "${WEBSHARE_PROXY_LIST_URL}" \
+            -o proxies.txt
+          echo "Proxy list downloaded. Lines: $(wc -l < proxies.txt)"
+        else
+          echo "WEBSHARE_PROXY_LIST_URL is empty, running without Webshare proxy."
+        fi
 
-          PROXY_LINE=$(grep -v '^[[:space:]]*$' proxies.txt | shuf -n 1)
+    - name: Syntax Check
+      run: npm run check
 
-          if [ -z "$PROXY_LINE" ]; then
-            echo "ERROR: No proxy found in Webshare proxy list."
-            exit 1
-          fi
+    - name: Run proxy runner (with up to 5 proxy switches)
+      env:
+        USERS_JSON: ${{ secrets.USERS_JSON }}
+        TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+        TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+      run: |
+        xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" node proxy_runner.js
 
-          IP=$(echo "$PROXY_LINE" | cut -d: -f1)
-          PORT=$(echo "$PROXY_LINE" | cut -d: -f2)
-          PROXY_USER=$(echo "$PROXY_LINE" | cut -d: -f3)
-          PROXY_PASS=$(echo "$PROXY_LINE" | cut -d: -f4)
+    - name: Upload Screenshots
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: screenshots
+        path: screenshots/
 
-          if [ -z "$IP" ] || [ -z "$PORT" ] || [ -z "$PROXY_USER" ] || [ -z "$PROXY_PASS" ]; then
-            echo "ERROR: Proxy line format invalid. Expected IP:PORT:USERNAME:PASSWORD"
-            echo "Selected line is invalid, hidden for security."
-            exit 1
-          fi
-
-          HTTP_PROXY_VALUE="http://${PROXY_USER}:${PROXY_PASS}@${IP}:${PORT}"
-
-          echo "::add-mask::${HTTP_PROXY_VALUE}"
-          echo "::add-mask::${PROXY_USER}"
-          echo "::add-mask::${PROXY_PASS}"
-
-          echo "HTTP_PROXY=${HTTP_PROXY_VALUE}" >> "$GITHUB_ENV"
-          echo "HTTPS_PROXY=${HTTP_PROXY_VALUE}" >> "$GITHUB_ENV"
-
-          echo "Selected Webshare proxy: ${IP}:${PORT}"
-
-      - name: Check proxy IP
-        run: |
-          echo "Direct IP:"
-          curl --noproxy '*' -s https://api.ipify.org || true
-          echo
-
-          if [ -n "$HTTP_PROXY" ]; then
-            echo "Proxy IP:"
-            curl -s -x "$HTTP_PROXY" https://api.ipify.org || true
-            echo
-          else
-            echo "HTTP_PROXY is empty."
-          fi
-
-      - name: Run Renew Script
-        env:
-          USERS_JSON: ${{ secrets.USERS_JSON }}
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: |
-          xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" node action_renew.js
-
-      - name: Upload Screenshots
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: screenshots
-          path: screenshots/
+    - name: Save proxy cooldown cache
+      if: always()
+      uses: actions/cache@v4
+      with:
+        path: proxy-cooldown.json
+        key: katabump-proxy-cooldown-${{ github.run_id }}
