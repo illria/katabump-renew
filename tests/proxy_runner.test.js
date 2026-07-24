@@ -22,6 +22,8 @@ function tests() {
     assert.strictEqual(typeof mod.emitGithubMask, 'function');
     assert.strictEqual(typeof mod.loadProxies, 'function');
     assert.strictEqual(typeof mod.selectRandomProxy, 'function');
+    assert.strictEqual(typeof mod.buildProxyCandidateQueue, 'function');
+    assert.strictEqual(typeof mod.getMaxProxyAttempts, 'function');
     assert.strictEqual(typeof mod.proxyKey, 'function');
     assert.strictEqual(typeof mod.safeProxyId, 'function');
 
@@ -234,6 +236,18 @@ function tests() {
     const selected = mod.selectRandomProxy([mod.parseProxyLine('1.2.3.4:8080:user:pass')], {});
     assert.ok(selected, 'selectRandomProxy should return parsed object');
     assert.strictEqual(selected.username, 'user', 'selected parsed should preserve username');
+
+    const queueProxies = [
+        mod.parseProxyLine('1.1.1.1:8080:user:pass'),
+        mod.parseProxyLine('2.2.2.2:8080:user:pass'),
+        mod.parseProxyLine('1.1.1.1:8080:user:pass')
+    ];
+    const queue = mod.buildProxyCandidateQueue(queueProxies, {
+        '2.2.2.2:8080': { until: Math.floor(Date.now() / 1000) + 3600 }
+    }, new Set(['3.3.3.3:8080']));
+    assert.deepStrictEqual(queue.map(item => mod.proxyKey(item)), ['1.1.1.1:8080']);
+    assert.strictEqual(mod.getMaxProxyAttempts(10, null), 10);
+    assert.strictEqual(mod.getMaxProxyAttempts(10, 4), 4);
 
     // loadProxies: no file → configured=false
     {

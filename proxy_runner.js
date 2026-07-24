@@ -17,6 +17,20 @@ const ACTION_TIMEOUT_MS = ACTION_TIMEOUT_MINUTES * 60 * 1000;
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN;
 const TG_CHAT_ID = process.env.TG_CHAT_ID;
 
+function parsePositiveNumber(value, fallback) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+const PROXY_COOLDOWN_HOURS = parsePositiveNumber(
+    process.env.PROXY_COOLDOWN_HOURS,
+    26
+);
+const CONFIGURED_MAX_PROXY_SWITCHES = parsePositiveNumber(
+    process.env.MAX_PROXY_SWITCHES,
+    null
+);
+
 // --- 退出码（与 action_renew.js 完全一致） ---
 const EXIT_CODE = {
     SUCCESS: 0,
@@ -39,11 +53,17 @@ const NON_RETRYABLE = new Set([
 ]);
 
 const CONFIG = {
-    MAX_PROXY_SWITCHES: 5,
+    MAX_PROXY_SWITCHES: CONFIGURED_MAX_PROXY_SWITCHES,
     COOLDOWN_FILE: path.join(process.cwd(), 'proxy-cooldown.json'),
-    COOLDOWN_HOURS: 4,
+    COOLDOWN_HOURS: PROXY_COOLDOWN_HOURS,
     PROXIES_FILE: path.join(process.cwd(), 'proxies.txt')
 };
+
+function getMaxProxyAttempts(validProxyCount, configuredLimit = CONFIG.MAX_PROXY_SWITCHES) {
+    if (validProxyCount <= 0) return 0;
+    const configuredMax = configuredLimit || validProxyCount;
+    return Math.min(validProxyCount, Math.max(1, Math.floor(configuredMax)));
+}
 
 function createAttemptResultFile(attempt) {
     const nonce = crypto.randomBytes(8).toString('hex');
@@ -92,7 +112,7 @@ function makeAttemptRecord(attempt, parsed, childResult) {
     };
 }
 
-function buildFinalSummary(finalCode, finalResult, attempts) {
+function buildFinalSummary(finalCode, finalResult, attempts, maxAttempts = attempts.length) {
     const lastAttempt = attempts.length > 0 ? attempts[attempts.length - 1] : null;
     const actionResult = finalResult || lastAttempt || {};
     let status = actionResult.status || actionStatusFromCode(finalCode);
@@ -118,6 +138,7 @@ function buildFinalSummary(finalCode, finalResult, attempts) {
         screenshotPath: actionResult.screenshotPath || (lastAttempt && lastAttempt.screenshotPath) || null,
         htmlPath: actionResult.htmlPath || (lastAttempt && lastAttempt.htmlPath) || null,
         attempts,
+        maxAttempts,
         accounts,
         counts
     };
@@ -138,7 +159,7 @@ function formatFinalNotification(summary) {
     const lines = [
         titles[summary.status] || titles.error,
         '',
-        `代理尝试：${summary.attempts.length}/${CONFIG.MAX_PROXY_SWITCHES}`
+        `代理尝试：${summary.attempts.length}/${summary.maxAttempts}`
     ];
     if (summary.accounts.length > 0) {
         lines.push(`账号总数：${summary.accounts.length}`);
@@ -173,8 +194,8 @@ async function sendFinalTelegram(summary) {
     }
 }
 
-async function finalizeWorkflow(finalCode, finalResult, attempts) {
-    const summary = buildFinalSummary(finalCode, finalResult, attempts);
+async function finalizeWorkflow(finalCode, finalResult, attempts, maxAttempts) {
+    const summary = buildFinalSummary(finalCode, finalResult, attempts, maxAttempts);
     await sendFinalTelegram(summary);
     return finalCode;
 }
@@ -202,10 +223,10 @@ function saveCooldowns(cooldowns) {
 }
 
 function addCooldown(cooldowns, proxyKey, reason) {
-    const until = Math.floor(Date.now() / 1000) + CONFIG.COOLDOWN_HOURS * 3600;
+    const until = Math.floor(Date.now() / 1000) + Math.round(CONFIG.COOLDOWN_HOURS * 3600);
     cooldowns[proxyKey] = { until, reason };
     saveCooldowns(cooldowns);
-    console.log(`[proxy-runner] 代理 ${proxyKey} 加入冷却，持续 ${CONFIG.COOLDOWN_HOURS}h，原因: ${reason}`);
+    console.log(`[proxy-runner] 代理 ${proxyKey} 冷却至 ${new Date(until * 1000).toISOString()}，原因: ${reason}`);
 }
 
 function removeExpiredCooldowns(cooldowns) {
@@ -455,6 +476,27 @@ function selectRandomProxy(proxies, cooldowns) {
     return parsed;
 }
 
+function buildProxyCandidateQueue(proxies, cooldowns, attemptedProxyKeys = new Set()) {
+    const now = Math.floor(Date.now() / 1000);
+    const seen = new Set(attemptedProxyKeys);
+    const candidates = [];
+
+    for (const parsed of proxies) {
+        const key = proxyKey(parsed);
+        if (seen.has(key)) continue;
+        if (cooldowns[key] && cooldowns[key].until > now) continue;
+        seen.add(key);
+        candidates.push(parsed);
+    }
+
+    // 只在本轮建队列时洗牌一次，之后按队列顺序遍历。
+    for (let i = candidates.length - 1; i > 0; i--) {
+        const j = crypto.randomInt(i + 1);
+        [candidates[i], candidates[j]] = [candidates[j], candidates[i]];
+    }
+    return candidates;
+}
+
 // ============================================================
 //  运行子进程
 // ============================================================
@@ -510,7 +552,7 @@ async function runActionRenew(parsed, attempt = 1) {
 // ============================================================
 async function runProxyWorkflow(attempts) {
     console.log(`[proxy-runner] 启动代理轮换控制器`);
-    console.log(`[proxy-runner] 最多尝试 ${CONFIG.MAX_PROXY_SWITCHES} 个代理，冷却 ${CONFIG.COOLDOWN_HOURS}h`);
+    console.log(`[proxy-runner] 代理冷却 ${CONFIG.COOLDOWN_HOURS}h`);
     console.log(`[proxy-runner] 退出码映射: SUCCESS=0 FATAL=1 PROXY_RETRY=42 NOT_READY=3 ALREADY_RENEWED=4 LOGIN_FAILED=5 NO_PROXY_AVAILABLE=6 RENEW_CAPTCHA_FAILED=43`);
 
     const proxyResult = loadProxies();
@@ -518,29 +560,46 @@ async function runProxyWorkflow(attempts) {
     let cooldowns = loadCooldowns();
     removeExpiredCooldowns(cooldowns);
 
-    for (let attempt = 1; attempt <= CONFIG.MAX_PROXY_SWITCHES; attempt++) {
-        console.log(`\n[proxy-runner] ===== 代理尝试 ${attempt}/${CONFIG.MAX_PROXY_SWITCHES} =====`);
+    const maxAttempts = proxies.length > 0
+        ? getMaxProxyAttempts(proxies.length)
+        : (proxyResult.configured ? 0 : 1);
+    console.log(`[proxy-runner] 有效代理 ${proxies.length} 条，本轮最多检查 ${maxAttempts} 条`);
+
+    const attemptedProxyKeys = new Set();
+    const candidates = buildProxyCandidateQueue(proxies, cooldowns, attemptedProxyKeys);
+
+    if (proxyResult.configured && proxies.length === 0) {
+        console.log('[proxy-runner] proxies.txt 存在但无有效代理，禁止静默直连');
+        return finalizeWorkflow(EXIT_CODE.NO_PROXY_AVAILABLE, {
+            status: 'no_proxy_available',
+            message: 'No valid proxy is configured',
+            accounts: []
+        }, attempts, maxAttempts);
+    }
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        console.log(`\n[proxy-runner] ===== 代理尝试 ${attempt}/${maxAttempts} =====`);
 
         // 1) 选代理
         let selection = null;
 
         if (proxies.length > 0) {
-            selection = selectRandomProxy(proxies, cooldowns);
+            while (candidates.length > 0) {
+                const candidate = candidates.shift();
+                const key = proxyKey(candidate);
+                if (attemptedProxyKeys.has(key)) continue;
+                attemptedProxyKeys.add(key);
+                selection = candidate;
+                break;
+            }
             if (!selection) {
                 console.log('[proxy-runner] 无可选代理（全部冷却中），本轮停止，不清空冷却名单');
                 return finalizeWorkflow(EXIT_CODE.NO_PROXY_AVAILABLE, {
                     status: 'no_proxy_available',
                     message: 'No proxy is currently available',
                     accounts: []
-                }, attempts);
+                }, attempts, maxAttempts);
             }
-        } else if (proxyResult.configured) {
-            console.log('[proxy-runner] proxies.txt 存在但无有效代理，禁止静默直连');
-            return finalizeWorkflow(EXIT_CODE.NO_PROXY_AVAILABLE, {
-                status: 'no_proxy_available',
-                message: 'No valid proxy is configured',
-                accounts: []
-            }, attempts);
         } else {
             console.log('[proxy-runner] 未配置 proxies.txt，无代理直连');
         }
@@ -559,7 +618,7 @@ async function runProxyWorkflow(attempts) {
                 console.log(`[proxy-runner] 业务状态码 ${code} 归一为 ${normalizedCode}（正常业务，非失败）`);
             }
             console.log(`[proxy-runner] 不可重试退出码 ${normalizedCode}，结束本轮`);
-            return finalizeWorkflow(normalizedCode, result.actionResult || attemptRecord, attempts);
+            return finalizeWorkflow(normalizedCode, result.actionResult || attemptRecord, attempts, maxAttempts);
         }
 
         if (code === EXIT_CODE.PROXY_RETRY && selection) {
@@ -573,20 +632,20 @@ async function runProxyWorkflow(attempts) {
 
         if (code === EXIT_CODE.FATAL) {
             console.log(`[proxy-runner] 退出码 1 (FATAL)，非代理问题，停止`);
-            return finalizeWorkflow(EXIT_CODE.FATAL, result.actionResult || attemptRecord, attempts);
+            return finalizeWorkflow(EXIT_CODE.FATAL, result.actionResult || attemptRecord, attempts, maxAttempts);
         }
 
         // 未知退出码也停止（不是 PROXY_RETRY）
         console.log(`[proxy-runner] 未知退出码 ${code}，不换代理，停止`);
-        return finalizeWorkflow(code, result.actionResult || attemptRecord, attempts);
+        return finalizeWorkflow(code, result.actionResult || attemptRecord, attempts, maxAttempts);
     }
 
-    console.log(`[proxy-runner] 已尝试 ${CONFIG.MAX_PROXY_SWITCHES} 个代理，均未成功`);
+    console.log(`[proxy-runner] 已尝试 ${maxAttempts} 个代理，均未成功`);
     return finalizeWorkflow(EXIT_CODE.FATAL, attempts[attempts.length - 1] || {
         status: 'proxy_exhausted',
         message: 'All proxy attempts returned PROXY_RETRY',
         accounts: []
-    }, attempts);
+    }, attempts, maxAttempts);
 }
 
 async function main() {
@@ -599,7 +658,7 @@ async function main() {
             status: 'error',
             message: error.message,
             accounts: []
-        }, attempts);
+        }, attempts, attempts.length);
     }
 }
 
@@ -622,6 +681,9 @@ module.exports = {
     selectRandomProxy,
     proxyKey,
     safeProxyId,
+    parsePositiveNumber,
+    getMaxProxyAttempts,
+    buildProxyCandidateQueue,
     runActionRenew,
     readActionResult,
     makeAttemptRecord,
