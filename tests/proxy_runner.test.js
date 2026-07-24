@@ -22,6 +22,11 @@ function tests() {
     assert.strictEqual(typeof mod.emitGithubMask, 'function');
     assert.strictEqual(typeof mod.loadProxies, 'function');
     assert.strictEqual(typeof mod.selectRandomProxy, 'function');
+    assert.strictEqual(typeof mod.buildProxyCandidateQueue, 'function');
+    assert.strictEqual(typeof mod.getMaxProxyAttempts, 'function');
+    assert.strictEqual(typeof mod.calculateCooldownUntil, 'function');
+    assert.strictEqual(typeof mod.loadCooldowns, 'function');
+    assert.strictEqual(typeof mod.isRealProxyNetworkFailure, 'function');
     assert.strictEqual(typeof mod.proxyKey, 'function');
     assert.strictEqual(typeof mod.safeProxyId, 'function');
 
@@ -204,6 +209,40 @@ function tests() {
     assert.strictEqual(successSummary.status, 'success');
     assert.strictEqual(successSummary.screenshotPath, 'screenshots/success_after_2.png');
 
+    const proxyFailureAttempts = Array.from({ length: 10 }, (_, index) => ({
+        attempt: index + 1,
+        proxy: `proxy-${index + 1}`,
+        code: 42,
+        status: 'proxy_retry',
+        message: 'network failure',
+        screenshotPath: `screenshots/retry-${index + 1}.png`,
+        accounts: []
+    }));
+    assert.strictEqual(mod.isRealProxyNetworkFailure(proxyFailureAttempts[0]), true);
+    assert.strictEqual(mod.isRealProxyNetworkFailure({ ...proxyFailureAttempts[0], status: 'login_captcha_required' }), false);
+    const directNotReady = {
+        attempt: 11,
+        proxy: 'direct',
+        directFallback: true,
+        code: 3,
+        status: 'not_ready',
+        message: 'not ready',
+        screenshotPath: 'screenshots/direct-not-ready.png',
+        accounts: [{ status: 'not_ready' }]
+    };
+    const directSummary = mod.buildFinalSummary(0, directNotReady, [...proxyFailureAttempts, directNotReady], 10);
+    const directMessage = mod.formatFinalNotification(directSummary);
+    assert.strictEqual(directSummary.proxyAttempts, 10);
+    assert.strictEqual(directSummary.directFallbackAttempted, true);
+    assert.strictEqual(directSummary.totalAttempts, 11);
+    assert.ok(directMessage.includes('代理尝试：10/10'));
+    assert.ok(directMessage.includes('直连 fallback：已执行'));
+    assert.ok(!directMessage.includes('11/10'));
+
+    const directFailure = { ...directNotReady, code: 1, status: 'error', message: 'direct failed' };
+    const directFailureSummary = mod.buildFinalSummary(1, directFailure, [...proxyFailureAttempts, directFailure], 10);
+    assert.ok(mod.formatFinalNotification(directFailureSummary).includes('直连 fallback：失败'));
+
     const exhaustedAttempts = [
         retryAttempt,
         { ...retryAttempt, attempt: 2, screenshotPath: 'screenshots/retry-2.png' },
@@ -234,6 +273,66 @@ function tests() {
     const selected = mod.selectRandomProxy([mod.parseProxyLine('1.2.3.4:8080:user:pass')], {});
     assert.ok(selected, 'selectRandomProxy should return parsed object');
     assert.strictEqual(selected.username, 'user', 'selected parsed should preserve username');
+
+    const queueProxies = [
+        mod.parseProxyLine('1.1.1.1:8080:user:pass'),
+        mod.parseProxyLine('2.2.2.2:8080:user:pass'),
+        mod.parseProxyLine('1.1.1.1:8080:user:pass')
+    ];
+    const queue = mod.buildProxyCandidateQueue(queueProxies, {
+        '2.2.2.2:8080': { until: Math.floor(Date.now() / 1000) + 3600 }
+    }, new Set(['3.3.3.3:8080']));
+    assert.deepStrictEqual(queue.map(item => mod.proxyKey(item)), ['1.1.1.1:8080']);
+    assert.strictEqual(mod.getMaxProxyAttempts(10, null), 10);
+    assert.strictEqual(mod.getMaxProxyAttempts(10, 4), 4);
+
+    // 26 小时冷却应跨过次日，且过期前不能重新进入候选队列。
+    const cooldownStart = Math.floor(new Date('2026-07-24T02:00:00.000Z').getTime() / 1000);
+    assert.strictEqual(
+        mod.calculateCooldownUntil(cooldownStart) - cooldownStart,
+        26 * 60 * 60
+    );
+    assert.strictEqual(
+        new Date(mod.calculateCooldownUntil(cooldownStart) * 1000).toISOString(),
+        '2026-07-25T04:00:00.000Z'
+    );
+    const restoredCooldowns = {
+        '4.4.4.4:8080': { until: Math.floor(Date.now() / 1000) + 3600, reason: 'restored' }
+    };
+    const restoredQueue = mod.buildProxyCandidateQueue([
+        mod.parseProxyLine('4.4.4.4:8080:user:pass'),
+        mod.parseProxyLine('5.5.5.5:8080:user:pass')
+    ], restoredCooldowns);
+    assert.deepStrictEqual(restoredQueue.map(item => mod.proxyKey(item)), ['5.5.5.5:8080']);
+
+    // 缓存恢复后仍按冷却状态过滤，而不是把已冷却代理重新放回随机池。
+    const originalExistsSync = fs.existsSync;
+    const originalReadFileSync = fs.readFileSync;
+    fs.existsSync = target => target === path.join(process.cwd(), 'proxy-cooldown.json');
+    fs.readFileSync = () => JSON.stringify(restoredCooldowns);
+    try {
+        assert.deepStrictEqual(mod.loadCooldowns(), restoredCooldowns);
+    } finally {
+        fs.existsSync = originalExistsSync;
+        fs.readFileSync = originalReadFileSync;
+    }
+
+    // 10 条有效代理应在一个候选队列中完整遍历且不重复。
+    const tenProxies = Array.from({ length: 10 }, (_, index) =>
+        mod.parseProxyLine(`${index + 1}.${index + 1}.${index + 1}.${index + 1}:8080:user:pass`)
+    );
+    const tenQueue = mod.buildProxyCandidateQueue(tenProxies, {});
+    assert.strictEqual(tenQueue.length, 10);
+    assert.strictEqual(new Set(tenQueue.map(item => mod.proxyKey(item))).size, 10);
+
+    // 总代理 10 条但冷却 8 条时，本轮最多只检查剩余 2 条。
+    const cooledEight = Object.fromEntries(tenProxies.slice(0, 8).map(item => [
+        mod.proxyKey(item),
+        { until: Math.floor(Date.now() / 1000) + 3600, reason: 'restored' }
+    ]));
+    const twoQueue = mod.buildProxyCandidateQueue(tenProxies, cooledEight);
+    assert.strictEqual(twoQueue.length, 2);
+    assert.strictEqual(mod.getMaxProxyAttempts(twoQueue.length, null), 2);
 
     // loadProxies: no file → configured=false
     {

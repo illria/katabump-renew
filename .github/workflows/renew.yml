@@ -60,7 +60,7 @@ jobs:
         npx playwright install-deps chrome
 
     - name: Restore proxy cooldown cache
-      uses: actions/cache@v4
+      uses: actions/cache/restore@v4
       with:
         path: proxy-cooldown.json
         key: katabump-proxy-cooldown-${{ github.run_id }}
@@ -89,7 +89,7 @@ jobs:
     - name: Syntax Check
       run: npm run check
 
-    - name: Run proxy runner (with up to 5 proxy switches)
+    - name: Run proxy runner (with dynamic proxy coverage)
       env:
         USERS_JSON: ${{ secrets.USERS_JSON }}
         TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
@@ -106,7 +106,7 @@ jobs:
 
     - name: Save proxy cooldown cache
       if: always()
-      uses: actions/cache@v4
+      uses: actions/cache/save@v4
       with:
         path: proxy-cooldown.json
         key: katabump-proxy-cooldown-${{ github.run_id }}
