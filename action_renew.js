@@ -1689,16 +1689,20 @@ async function runMain() {
         }
     }
 
-    let browser;
+    let browser = null;
+    let startupReady = false;
     let startupError = null;
     for (let startupAttempt = 1; startupAttempt <= 2; startupAttempt++) {
         try {
             await launchChrome();
             browser = await connectToChrome();
             await ensureCdpAnchorPage(browser);
+            startupReady = true;
             startupError = null;
             break;
         } catch (error) {
+            browser = null;
+            startupReady = false;
             startupError = error;
             await closeActiveBrowser();
             await closeActiveChrome();
@@ -1715,7 +1719,7 @@ async function runMain() {
         }
     }
 
-    if (!browser) {
+    if (!startupReady || !browser) {
         const error = startupError || new Error('Chrome/CDP 启动失败');
         console.error('[主流程] Chrome/CDP 启动失败:', error.code ? `${error.code}: ${error.message}` : error.message);
         setLatestActionResult({
