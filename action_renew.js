@@ -92,7 +92,10 @@ process.env.NO_PROXY = 'localhost,127.0.0.1';
 
 const HTTP_PROXY = process.env.HTTP_PROXY;
 const TARGET_LOGIN_URL = 'https://dashboard.katabump.com/auth/login';
-const CHROME_BOOT_TIMEOUT_MS = 20_000;
+const CHROME_BOOT_TIMEOUT_MIN_MS = 10_000;
+const CHROME_BOOT_TIMEOUT_MAX_MS = 90_000;
+const CHROME_BOOT_TIMEOUT_DEFAULT_MS = 35_000;
+const CHROME_DIAGNOSTIC_MAX_BYTES = 16 * 1024;
 const CDP_CONNECT_ATTEMPTS = 5;
 const CDP_CONNECT_DELAY_MS = 2_000;
 let PROXY_CONFIG = null;
@@ -102,8 +105,20 @@ let activeBrowserConnection = null;
 let activeCdpAnchorPage = null;
 let activeChromeChild = null;
 let activeChromeUserDataDir = null;
+let activeChromeDiagnostics = { stdout: '', stderr: '' };
 let shutdownRequested = false;
 let shutdownPromise = null;
+
+function getChromeBootTimeoutMs(value) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return CHROME_BOOT_TIMEOUT_DEFAULT_MS;
+    return Math.min(
+        CHROME_BOOT_TIMEOUT_MAX_MS,
+        Math.max(CHROME_BOOT_TIMEOUT_MIN_MS, Math.round(parsed))
+    );
+}
+
+const CHROME_BOOT_TIMEOUT_MS = getChromeBootTimeoutMs(process.env.CHROME_BOOT_TIMEOUT_MS);
 
 if (HTTP_PROXY) {
     try {
@@ -217,7 +232,7 @@ function checkPort(port) {
     return new Promise((resolve) => {
         const request = http.get(`http://127.0.0.1:${port}/json/version`, (response) => {
             response.resume();
-            resolve(Boolean(response.statusCode));
+            resolve(response.statusCode >= 200 && response.statusCode < 300);
         });
         request.setTimeout(1000, () => {
             request.destroy();
@@ -227,25 +242,140 @@ function checkPort(port) {
     });
 }
 
-function waitForChromePort(port, timeoutMs = CHROME_BOOT_TIMEOUT_MS) {
-    const deadline = Date.now() + timeoutMs;
-    return (async () => {
-        while (Date.now() < deadline) {
-            if (await checkPort(port)) return true;
-            await new Promise(resolve => setTimeout(resolve, 500));
+function appendChromeDiagnostic(streamName, chunk) {
+    const text = Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk);
+    const combined = `${activeChromeDiagnostics[streamName] || ''}${text}`;
+    const bytes = Buffer.from(combined, 'utf8');
+    activeChromeDiagnostics[streamName] = bytes.length > CHROME_DIAGNOSTIC_MAX_BYTES
+        ? bytes.subarray(-CHROME_DIAGNOSTIC_MAX_BYTES).toString('utf8')
+        : combined;
+}
+
+function sanitizeChromeDiagnostic(text) {
+    return String(text || '')
+        .replace(/(https?:\/\/)([^/\s:@]+):([^@\s]+)@/gi, '$1***:***@')
+        .replace(/\b(password|passwd|token|secret|authorization)\s*[:=]\s*[^\s]+/gi, '$1=***');
+}
+
+function logChromeDiagnostic(label, error = null) {
+    if (error) {
+        console.error(`[Chrome] ${label}，code=${error.exitCode ?? 'null'} signal=${error.signal ?? 'null'}`);
+    } else {
+        console.error(`[Chrome] ${label}`);
+    }
+
+    const stderr = sanitizeChromeDiagnostic(activeChromeDiagnostics.stderr).trim();
+    if (stderr) console.error(`[Chrome] stderr 摘要: ${stderr}`);
+}
+
+function makeChromeStartupError(code, message, details = {}) {
+    const error = new Error(message);
+    error.code = code;
+    Object.assign(error, details);
+    return error;
+}
+
+function waitForChromeSpawn(child) {
+    return new Promise((resolve, reject) => {
+        let settled = false;
+
+        const cleanup = () => {
+            child.removeListener('spawn', onSpawn);
+            child.removeListener('error', onError);
+            child.removeListener('exit', onExit);
+        };
+        const settle = (callback, value) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            callback(value);
+        };
+        const onSpawn = () => settle(resolve, { event: 'spawn' });
+        const onError = (error) => settle(reject, makeChromeStartupError(
+            'chrome_spawn_error',
+            `Chrome spawn 失败: ${error.message}`,
+            { cause: error }
+        ));
+        const onExit = (code, signal) => settle(reject, makeChromeStartupError(
+            'chrome_exited_before_cdp',
+            `Chrome 在 CDP 初始化前退出: code=${code ?? 'null'} signal=${signal ?? 'null'}`,
+            { exitCode: code, signal }
+        ));
+
+        child.once('spawn', onSpawn);
+        child.once('error', onError);
+        child.once('exit', onExit);
+        if (child.exitCode !== null) {
+            onExit(child.exitCode, child.signalCode || null);
         }
-        return false;
-    })();
+    });
+}
+
+function waitForChromePort(port, child, timeoutMs = CHROME_BOOT_TIMEOUT_MS) {
+    return new Promise((resolve) => {
+        let settled = false;
+        let pollTimer = null;
+        let timeoutTimer = null;
+
+        const cleanup = () => {
+            if (pollTimer) clearInterval(pollTimer);
+            if (timeoutTimer) clearTimeout(timeoutTimer);
+            child.removeListener('exit', onExit);
+            child.removeListener('error', onError);
+        };
+        const finish = (result) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            resolve(result);
+        };
+        const onExit = (code, signal) => finish({
+            ok: false,
+            code: 'chrome_exited_before_cdp',
+            exitCode: code,
+            signal
+        });
+        const onError = (error) => finish({
+            ok: false,
+            code: 'chrome_spawn_error',
+            error
+        });
+        const poll = async () => {
+            if (await checkPort(port)) {
+                finish({ ok: true });
+            }
+        };
+
+        child.once('exit', onExit);
+        child.once('error', onError);
+        if (child.exitCode !== null) {
+            finish({
+                ok: false,
+                code: 'chrome_exited_before_cdp',
+                exitCode: child.exitCode,
+                signal: child.signalCode || null
+            });
+            return;
+        }
+        poll();
+        pollTimer = setInterval(poll, 500);
+        timeoutTimer = setTimeout(() => finish({
+            ok: false,
+            code: 'chrome_cdp_timeout'
+        }), timeoutMs);
+    });
 }
 
 async function launchChrome() {
     DEBUG_PORT = await getAvailableDebugPort();
     activeChromeUserDataDir = fs.mkdtempSync(path.join(os.tmpdir(), `katabump-chrome-${process.pid}-`));
+    activeChromeDiagnostics = { stdout: '', stderr: '' };
     console.log(`检查 Chrome 调试端口 ${DEBUG_PORT}...`);
 
     const launchOptions = buildBrowserLaunchOptions(PROXY_CONFIG);
     const args = [
         ...launchOptions.args,
+        '--remote-debugging-address=127.0.0.1',
         `--remote-debugging-port=${DEBUG_PORT}`,
         `--user-data-dir=${activeChromeUserDataDir}`
     ];
@@ -257,27 +387,55 @@ async function launchChrome() {
     console.log(`正在启动 Chrome (路径: ${CHROME_PATH})...`);
     activeChromeChild = spawn(CHROME_PATH, args, {
         detached: false,
-        stdio: 'ignore'
+        stdio: ['ignore', 'pipe', 'pipe']
     });
+    activeChromeChild.stdout.on('data', (chunk) => appendChromeDiagnostic('stdout', chunk));
+    activeChromeChild.stderr.on('data', (chunk) => appendChromeDiagnostic('stderr', chunk));
 
     try {
-        await new Promise((resolve, reject) => {
-            activeChromeChild.once('error', reject);
-            if (activeChromeChild.exitCode !== null) {
-                reject(new Error(`Chrome exited with code ${activeChromeChild.exitCode}`));
-            } else {
-                resolve();
-            }
-        });
+        await waitForChromeSpawn(activeChromeChild);
     } catch (error) {
+        if (error.code === 'chrome_exited_before_cdp') {
+            logChromeDiagnostic('子进程已提前退出', error);
+        } else {
+            logChromeDiagnostic(`启动失败: ${error.message}`);
+        }
         await closeActiveChrome();
-        throw new Error(`Chrome 启动失败: ${error.message}`);
+        throw error;
     }
 
     console.log('正在等待 Chrome 初始化...');
-    if (!await waitForChromePort(DEBUG_PORT)) {
+    const portResult = await waitForChromePort(DEBUG_PORT, activeChromeChild);
+    if (!portResult.ok) {
+        if (portResult.code === 'chrome_exited_before_cdp') {
+            const error = makeChromeStartupError(
+                portResult.code,
+                `Chrome 在 CDP 初始化前退出: code=${portResult.exitCode ?? 'null'} signal=${portResult.signal ?? 'null'}`,
+                portResult
+            );
+            logChromeDiagnostic('子进程已提前退出', error);
+            await closeActiveChrome();
+            throw error;
+        }
+        if (portResult.code === 'chrome_spawn_error') {
+            const error = makeChromeStartupError(
+                portResult.code,
+                `Chrome 启动错误: ${portResult.error ? portResult.error.message : 'unknown error'}`,
+                portResult
+            );
+            logChromeDiagnostic(`启动错误: ${error.message}`);
+            await closeActiveChrome();
+            throw error;
+        }
+
+        const error = makeChromeStartupError(
+            'chrome_cdp_timeout',
+            `Chrome 调试端口 ${DEBUG_PORT} 未在 ${CHROME_BOOT_TIMEOUT_MS}ms 内就绪`,
+            portResult
+        );
+        logChromeDiagnostic(`调试端口 ${DEBUG_PORT} 等待超时`);
         await closeActiveChrome();
-        throw new Error(`Chrome 调试端口 ${DEBUG_PORT} 未在 ${CHROME_BOOT_TIMEOUT_MS}ms 内就绪`);
+        throw error;
     }
 }
 
@@ -1532,16 +1690,38 @@ async function runMain() {
     }
 
     let browser;
-    try {
-        await launchChrome();
-        browser = await connectToChrome();
-        await ensureCdpAnchorPage(browser);
-    } catch (error) {
-        console.error('[主流程] Chrome/CDP 启动失败:', error.message);
+    let startupError = null;
+    for (let startupAttempt = 1; startupAttempt <= 2; startupAttempt++) {
+        try {
+            await launchChrome();
+            browser = await connectToChrome();
+            await ensureCdpAnchorPage(browser);
+            startupError = null;
+            break;
+        } catch (error) {
+            startupError = error;
+            await closeActiveBrowser();
+            await closeActiveChrome();
+
+            const canRetry = startupAttempt === 1 && [
+                'chrome_exited_before_cdp',
+                'chrome_cdp_timeout'
+            ].includes(error.code);
+            if (canRetry) {
+                console.error(`[主流程] Chrome/CDP 启动失败（${error.code}），同一代理重启一次`);
+                continue;
+            }
+            break;
+        }
+    }
+
+    if (!browser) {
+        const error = startupError || new Error('Chrome/CDP 启动失败');
+        console.error('[主流程] Chrome/CDP 启动失败:', error.code ? `${error.code}: ${error.message}` : error.message);
         setLatestActionResult({
             exitCode: EXIT_CODE.FATAL,
             status: 'error',
-            message: `Chrome/CDP startup failed: ${error.message}`
+            message: `Chrome/CDP startup failed${error.code ? ` (${error.code})` : ''}: ${error.message}`
         });
         return EXIT_CODE.FATAL;
     }
