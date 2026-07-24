@@ -223,10 +223,14 @@ function saveCooldowns(cooldowns) {
 }
 
 function addCooldown(cooldowns, proxyKey, reason) {
-    const until = Math.floor(Date.now() / 1000) + Math.round(CONFIG.COOLDOWN_HOURS * 3600);
+    const until = calculateCooldownUntil();
     cooldowns[proxyKey] = { until, reason };
     saveCooldowns(cooldowns);
     console.log(`[proxy-runner] 代理 ${proxyKey} 冷却至 ${new Date(until * 1000).toISOString()}，原因: ${reason}`);
+}
+
+function calculateCooldownUntil(nowSeconds = Math.floor(Date.now() / 1000)) {
+    return nowSeconds + Math.round(CONFIG.COOLDOWN_HOURS * 3600);
 }
 
 function removeExpiredCooldowns(cooldowns) {
@@ -560,19 +564,27 @@ async function runProxyWorkflow(attempts) {
     let cooldowns = loadCooldowns();
     removeExpiredCooldowns(cooldowns);
 
-    const maxAttempts = proxies.length > 0
-        ? getMaxProxyAttempts(proxies.length)
-        : (proxyResult.configured ? 0 : 1);
-    console.log(`[proxy-runner] 有效代理 ${proxies.length} 条，本轮最多检查 ${maxAttempts} 条`);
-
     const attemptedProxyKeys = new Set();
     const candidates = buildProxyCandidateQueue(proxies, cooldowns, attemptedProxyKeys);
+    const maxAttempts = proxies.length > 0
+        ? getMaxProxyAttempts(candidates.length)
+        : (proxyResult.configured ? 0 : 1);
+    console.log(`[proxy-runner] 有效代理 ${proxies.length} 条，冷却后候选 ${candidates.length} 条，本轮最多检查 ${maxAttempts} 条`);
 
     if (proxyResult.configured && proxies.length === 0) {
         console.log('[proxy-runner] proxies.txt 存在但无有效代理，禁止静默直连');
         return finalizeWorkflow(EXIT_CODE.NO_PROXY_AVAILABLE, {
             status: 'no_proxy_available',
             message: 'No valid proxy is configured',
+            accounts: []
+        }, attempts, maxAttempts);
+    }
+
+    if (proxies.length > 0 && candidates.length === 0) {
+        console.log('[proxy-runner] 所有有效代理当前均在冷却中，本轮停止');
+        return finalizeWorkflow(EXIT_CODE.NO_PROXY_AVAILABLE, {
+            status: 'no_proxy_available',
+            message: 'All valid proxies are currently cooling down',
             accounts: []
         }, attempts, maxAttempts);
     }
@@ -684,6 +696,8 @@ module.exports = {
     parsePositiveNumber,
     getMaxProxyAttempts,
     buildProxyCandidateQueue,
+    calculateCooldownUntil,
+    loadCooldowns,
     runActionRenew,
     readActionResult,
     makeAttemptRecord,
