@@ -22,6 +22,11 @@ function parsePositiveNumber(value, fallback) {
     return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function parseNonNegativeNumber(value, fallback) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
 const PROXY_COOLDOWN_HOURS = parsePositiveNumber(
     process.env.PROXY_COOLDOWN_HOURS,
     26
@@ -30,13 +35,17 @@ const CONFIGURED_MAX_PROXY_SWITCHES = parsePositiveNumber(
     process.env.MAX_PROXY_SWITCHES,
     null
 );
+const MAX_RENEW_CAPTCHA_RETRIES = Math.floor(parseNonNegativeNumber(
+    process.env.MAX_RENEW_CAPTCHA_RETRIES,
+    1
+));
 
 // --- 退出码（与 action_renew.js 完全一致） ---
 const EXIT_CODE = {
     SUCCESS: 0,
     FATAL: 1,
     PROXY_RETRY: 42,       // 只有这个码才触发代理轮换
-    RENEW_CAPTCHA_FAILED: 43, // Renew ALTCHA 失败，不换代理
+    RENEW_CAPTCHA_FAILED: 43, // Renew ALTCHA 失败：同代理重试后可切换代理
     NOT_READY: 3,
     ALREADY_RENEWED: 4,
     LOGIN_FAILED: 5,
@@ -131,7 +140,11 @@ function buildFinalSummary(finalCode, finalResult, attempts, maxAttempts = attem
     const lastAttempt = attempts.length > 0 ? attempts[attempts.length - 1] : null;
     const actionResult = finalResult || lastAttempt || {};
     const directFallbackRecord = attempts.find(attempt => attempt.directFallback === true) || null;
-    const proxyAttempts = attempts.filter(attempt => attempt.proxy !== 'direct').length;
+    const proxyAttempts = new Set(
+        attempts
+            .filter(attempt => attempt.proxy !== 'direct')
+            .map(attempt => attempt.proxy)
+    ).size;
     const directFallbackAttempted = Boolean(directFallbackRecord);
     let status = actionResult.status || actionStatusFromCode(finalCode);
     if (finalCode === EXIT_CODE.NO_PROXY_AVAILABLE) status = 'no_proxy_available';
@@ -587,6 +600,7 @@ async function runProxyWorkflow(attempts) {
     console.log(`[proxy-runner] 启动代理轮换控制器`);
     console.log(`[proxy-runner] 代理冷却 ${CONFIG.COOLDOWN_HOURS}h`);
     console.log(`[proxy-runner] 退出码映射: SUCCESS=0 FATAL=1 PROXY_RETRY=42 NOT_READY=3 ALREADY_RENEWED=4 LOGIN_FAILED=5 NO_PROXY_AVAILABLE=6 RENEW_CAPTCHA_FAILED=43`);
+    console.log(`[proxy-runner] 续期验证码失败最多自动重试 ${MAX_RENEW_CAPTCHA_RETRIES} 次`);
 
     const proxyResult = loadProxies();
     const proxies = proxyResult.valid;
@@ -660,12 +674,47 @@ async function runProxyWorkflow(attempts) {
         }
 
         // 2) 跑业务脚本；子进程由 action_renew.js 自己管理 BrowserContext/Browser 生命周期。
-        const result = await runActionRenew(selection || null, attempt);
-        const code = result.code;
-        const attemptRecord = makeAttemptRecord(attempt, selection, result);
-        attempts.push(attemptRecord);
+        // Renew ALTCHA checkbox 的瞬时点击失败不应立即通知，先在同一代理下重跑本轮操作。
+        let result;
+        let code;
+        let attemptRecord;
+        let renewCaptchaRetries = 0;
+        while (true) {
+            const actionAttempt = attempts.length + 1;
+            result = await runActionRenew(selection || null, actionAttempt);
+            code = result.code;
+            attemptRecord = makeAttemptRecord(actionAttempt, selection, result);
+            attempts.push(attemptRecord);
+
+            if (
+                code === EXIT_CODE.RENEW_CAPTCHA_FAILED &&
+                renewCaptchaRetries < MAX_RENEW_CAPTCHA_RETRIES
+            ) {
+                renewCaptchaRetries += 1;
+                console.log(
+                    `[proxy-runner] 当前代理续期验证码未完成，不发送通知，重新运行操作 ` +
+                    `(${renewCaptchaRetries}/${MAX_RENEW_CAPTCHA_RETRIES})`
+                );
+                continue;
+            }
+            break;
+        }
 
         // 3) 按退出码决定
+        if (code === EXIT_CODE.RENEW_CAPTCHA_FAILED && selection) {
+            if (candidates.length > 0) {
+                console.log('[proxy-runner] 同一代理重试仍未完成续期验证码，切换下一个代理');
+                continue;
+            }
+            console.log('[proxy-runner] 续期验证码重试仍失败，且已无其他代理可切换');
+            return finalizeWorkflow(
+                EXIT_CODE.RENEW_CAPTCHA_FAILED,
+                result.actionResult || attemptRecord,
+                attempts,
+                maxAttempts
+            );
+        }
+
         if (NON_RETRYABLE.has(code)) {
             // NOT_READY(3) 和 ALREADY_RENEWED(4) 是正常业务状态，归一为 0 避免 GitHub Actions 显示失败
             const normalizedCode = normalizeFinalCode(code);
@@ -693,6 +742,17 @@ async function runProxyWorkflow(attempts) {
         // 未知退出码也停止（不是 PROXY_RETRY）
         console.log(`[proxy-runner] 未知退出码 ${code}，不换代理，停止`);
         return finalizeWorkflow(code, result.actionResult || attemptRecord, attempts, maxAttempts);
+    }
+
+    const lastAttempt = attempts[attempts.length - 1];
+    if (lastAttempt && lastAttempt.code === EXIT_CODE.RENEW_CAPTCHA_FAILED) {
+        console.log('[proxy-runner] 已达到代理尝试上限，发送最终验证码失败通知');
+        return finalizeWorkflow(
+            EXIT_CODE.RENEW_CAPTCHA_FAILED,
+            lastAttempt,
+            attempts,
+            maxAttempts
+        );
     }
 
     if (
