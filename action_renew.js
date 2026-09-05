@@ -1371,6 +1371,16 @@ function detectNotReady(text) {
     return null;
 }
 
+/** 从续期后的 URL 中提取站点返回的 renew-error 参数 */
+function getRenewErrorFromUrl(url) {
+    try {
+        const renewError = new URL(url).searchParams.get('renew-error');
+        return renewError ? renewError.replace(/\s+/g, ' ').trim() : '';
+    } catch (e) {
+        return '';
+    }
+}
+
 /** 检测验证码/checkbox 阻断
  *  只检测动态的浏览器原生校验消息，不把静态 ALTCHA 标签当阻断 */
 function detectCaptchaRequired(text) {
@@ -1421,6 +1431,31 @@ async function isAltchaCheckboxChecked(page, modal) {
     } catch (e) { }
 
     return false;
+}
+
+/** 只把实际可见的 ALTCHA 控件识别为验证码，忽略页面预加载的隐藏节点 */
+async function hasVisibleAltchaWidget(modal) {
+    const selectors = [
+        'altcha-widget',
+        '[data-altcha]',
+        '.altcha',
+        'input[type="checkbox"]',
+        'iframe[src*="altcha"]'
+    ];
+
+    for (const selector of selectors) {
+        const locator = modal.locator(selector);
+        const count = await locator.count().catch(() => 0);
+        for (let index = 0; index < count; index++) {
+            const candidate = locator.nth(index);
+            if (!(await candidate.isVisible().catch(() => false))) continue;
+            const box = await candidate.boundingBox().catch(() => null);
+            if (box && box.width > 0 && box.height > 0) return true;
+        }
+    }
+
+    const protectedLabel = modal.getByText(/Protected by ALTCHA/i).last();
+    return await protectedLabel.isVisible().catch(() => false);
 }
 
 /** 检测续期成功文本 */
@@ -1983,14 +2018,38 @@ async function runMain() {
                     }
                 }
 
-                // 如果有 See 按钮，点击它；否则认为已在 dashboard 页面
-                try {
-                    const seeBtn = page.getByRole('link', { name: 'See' }).first();
-                    if (await seeBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
-                        await seeBtn.click();
-                        console.log('[登录] 已点击 See 按钮。');
+                // Dashboard 的服务器列表由 /api-client/list-servers 异步填充。
+                // 必须等待实际的服务器入口出现并点击 See，Renew 只存在于详情页。
+                if (!stopCurrentUser && !shouldStopAllUsers) {
+                    try {
+                        const seeBtn = page.locator('a[href*="/servers/edit?id="]').first();
+                        try {
+                            await seeBtn.waitFor({ state: 'visible', timeout: 20000 });
+                        } catch (firstError) {
+                            console.warn(`[登录] See 入口尚未出现，刷新 Dashboard 后重试: ${firstError.message}`);
+                            await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 });
+                            await seeBtn.waitFor({ state: 'visible', timeout: 20000 });
+                        }
+
+                        const seeHref = await seeBtn.getAttribute('href');
+                        console.log(`[登录] 服务器入口已加载: ${seeHref || 'unknown'}`);
+                        await Promise.all([
+                            page.waitForURL(url => /\/servers\/edit\?id=/i.test(url), { timeout: 15000 }),
+                            seeBtn.click()
+                        ]);
+                        console.log(`[登录] 已点击 See 按钮，当前 URL: ${page.url()}`);
+
+                        const renewBtn = page.getByRole('button', { name: 'Renew', exact: true }).first();
+                        await renewBtn.waitFor({ state: 'visible', timeout: 15000 });
+                        console.log('[登录] 已进入服务器详情页，Renew 按钮已出现。');
+                    } catch (e) {
+                        console.error(`[登录] See 或服务器详情页未就绪: ${e.message} (URL: ${page.url()})`);
+                        runStatus = 'error';
+                        blockMessage = `Server See entry or Renew button did not appear after login: ${e.message}`;
+                        await dumpDebugSnapshot(page, `server_entry_not_ready_${accountLabel}`);
+                        stopCurrentUser = true;
                     }
-                } catch (e) { }
+                }
             }
 
             // 3. Renew 主循环
@@ -2031,8 +2090,7 @@ async function runMain() {
                     // 识别弹窗验证类型：ALTCHA / CF Turnstile / 无，非 CF 时跳过
                     // 只用强特征，限定当前弹窗
                     const hasCfInModal = await modal.locator('.cf-turnstile, iframe[src*="challenges.cloudflare.com"]').count().catch(() => 0) > 0;
-                    const hasAltchaInModal2 = /Protected by ALTCHA/i.test(modalText)
-                        || await modal.locator('altcha-widget, [data-altcha], .altcha').count().catch(() => 0) > 0;
+                    const hasAltchaInModal2 = await hasVisibleAltchaWidget(modal);
                     console.log(`[Renew阶段] 弹窗验证类型: ${hasAltchaInModal2 ? 'ALTCHA' : hasCfInModal ? 'CF Turnstile' : '无'}`);
 
                     if (hasCfInModal && !hasAltchaInModal2) {
@@ -2069,8 +2127,7 @@ async function runMain() {
                     }
 
                     // 【ALTCHA 前置检测】modal text 含 ALTCHA 关键词时，必须先完成 checkbox 才能点 confirm
-                    const hasAltchaInModal = /Protected by ALTCHA/i.test(modalText)
-                        || await modal.locator('altcha-widget, [data-altcha], .altcha').count().catch(() => 0) > 0;
+                    const hasAltchaInModal = hasAltchaInModal2;
                     if (hasAltchaInModal) {
                         console.log('[ALTCHA] Modal 检测到 ALTCHA/checkbox 验证，先完成验证再点 confirm。');
                         const cbCheckedBefore = await isAltchaCheckboxChecked(page, modal);
@@ -2132,7 +2189,13 @@ async function runMain() {
                     console.log(`[诊断] 点击后页面文本片段: ${pageTextAfterClick.substring(0, 300)}`);
 
                     // 检查 1: not_ready
-                    const notReadyAfter = detectNotReady(pageTextAfterClick);
+                    const renewErrorAfterClick = getRenewErrorFromUrl(currentUrlAfterClick);
+                    if (renewErrorAfterClick) {
+                        console.log(`[诊断] 点击后 renew-error: ${renewErrorAfterClick.substring(0, 300)}`);
+                    }
+                    const notReadyAfter = detectNotReady(
+                        [pageTextAfterClick, renewErrorAfterClick].filter(Boolean).join('\n')
+                    );
                     if (notReadyAfter) {
                         console.log('   >> ⏳ 暂无法续期 (after click)。停止重试。');
                         console.log('   >> 页面提示:', typeof notReadyAfter === 'string' ? notReadyAfter : notReadyAfter.raw);
